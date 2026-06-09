@@ -157,6 +157,43 @@ interface EmbeddingCapabilities {
   dimensionsField: string | null;
 }
 
+type EmbeddingRequestPayload = {
+  model: string;
+  input: string | string[];
+  encoding_format?: "float";
+  normalized?: boolean;
+  task?: string;
+  input_type?: string;
+  dimensions?: number;
+  output_dimension?: number;
+};
+
+type ProviderEmbeddingResponse = {
+  data: Array<{
+    embedding?: number[];
+  }>;
+};
+
+type NativeFetchOptions = {
+  signal?: AbortSignal;
+  timeoutMs: number;
+};
+
+type OpenAIEmbeddingCreatePayload = Parameters<OpenAI["embeddings"]["create"]>[0];
+
+class EmbeddingHttpError extends Error {
+  public readonly status: number;
+  public readonly statusCode: number;
+
+  constructor(provider: string, status: number, statusText: string, body: string) {
+    const detail = body.trim().slice(0, 200);
+    super(`${provider} embedding failed: ${status} ${statusText}${detail ? ` ${detail}` : ""}`);
+    this.name = "EmbeddingHttpError";
+    this.status = status;
+    this.statusCode = status;
+  }
+}
+
 // Known embedding model dimensions
 const EMBEDDING_DIMENSIONS: Record<string, number> = {
   "text-embedding-3-small": 1536,
@@ -205,22 +242,24 @@ function getErrorMessage(error: unknown): string {
 
 function getErrorStatus(error: unknown): number | undefined {
   if (!error || typeof error !== "object") return undefined;
-  const err = error as Record<string, any>;
+  const err = error as Record<string, unknown>;
   if (typeof err.status === "number") return err.status;
   if (typeof err.statusCode === "number") return err.statusCode;
   if (err.error && typeof err.error === "object") {
-    if (typeof err.error.status === "number") return err.error.status;
-    if (typeof err.error.statusCode === "number") return err.error.statusCode;
+    const nested = err.error as Record<string, unknown>;
+    if (typeof nested.status === "number") return nested.status;
+    if (typeof nested.statusCode === "number") return nested.statusCode;
   }
   return undefined;
 }
 
 function getErrorCode(error: unknown): string | undefined {
   if (!error || typeof error !== "object") return undefined;
-  const err = error as Record<string, any>;
+  const err = error as Record<string, unknown>;
   if (typeof err.code === "string") return err.code;
-  if (err.error && typeof err.error === "object" && typeof err.error.code === "string") {
-    return err.error.code;
+  if (err.error && typeof err.error === "object") {
+    const nested = err.error as Record<string, unknown>;
+    if (typeof nested.code === "string") return nested.code;
   }
   return undefined;
 }
@@ -312,6 +351,7 @@ function getEmbeddingCapabilities(profile: EmbeddingProviderProfile): EmbeddingC
           "retrieval.query": "query",
           "retrieval.passage": "document",
           "query": "query",
+          "passage": "document",
           "document": "document",
         },
         dimensionsField: "output_dimension",
@@ -476,7 +516,10 @@ export class Embedder {
   private readonly _taskQuery?: string;
   private readonly _taskPassage?: string;
   private readonly _normalized?: boolean;
+  private readonly _providerProfile: EmbeddingProviderProfile;
   private readonly _capabilities: EmbeddingCapabilities;
+  private readonly _apiKeys: string[];
+  private readonly _clientTimeoutMs: number;
 
   /** Optional requested dimensions to pass through to the embedding provider (OpenAI-compatible). */
   private readonly _requestDimensions?: number;
@@ -489,6 +532,7 @@ export class Embedder {
     // Normalize apiKey to array and resolve environment variables
     const apiKeys = Array.isArray(config.apiKey) ? config.apiKey : [config.apiKey];
     const resolvedKeys = apiKeys.map(k => resolveEnvVars(k));
+    this._apiKeys = resolvedKeys;
 
     this._model = config.model;
     this._baseURL = config.baseURL;
@@ -500,10 +544,12 @@ export class Embedder {
     // Enable auto-chunking by default for better handling of long documents
     this._autoChunk = config.chunking !== false;
     const profile = detectEmbeddingProviderProfile(this._baseURL, this._model);
+    this._providerProfile = profile;
     this._capabilities = getEmbeddingCapabilities(profile);
     const clientTimeoutMs = Number.isFinite(config.clientTimeoutMs) && config.clientTimeoutMs! > 0
       ? Math.floor(config.clientTimeoutMs!)
       : DEFAULT_EMBED_CLIENT_TIMEOUT_MS;
+    this._clientTimeoutMs = clientTimeoutMs;
 
     // Warn if configured fields will be silently ignored by this provider profile
     if (config.normalized !== undefined && !this._capabilities.normalized) {
@@ -563,11 +609,18 @@ export class Embedder {
     return client;
   }
 
+  /** Return the next raw API key in the same round-robin order as clients. */
+  private nextApiKey(): string {
+    const key = this._apiKeys[this._clientIndex % this._apiKeys.length];
+    this._clientIndex = (this._clientIndex + 1) % this._apiKeys.length;
+    return key;
+  }
+
   /** Check whether an error is a rate-limit / quota-exceeded / overload error. */
   private isRateLimitError(error: unknown): boolean {
     if (!error || typeof error !== "object") return false;
 
-    const err = error as Record<string, any>;
+    const err = error as Record<string, unknown>;
 
     // HTTP status: 429 (rate limit) or 503 (service overload)
     if (err.status === 429 || err.status === 503) return true;
@@ -578,8 +631,9 @@ export class Embedder {
     // Nested error object (some providers)
     const nested = err.error;
     if (nested && typeof nested === "object") {
-      if (nested.type === "rate_limit_exceeded" || nested.type === "insufficient_quota") return true;
-      if (nested.code === "rate_limit_exceeded" || nested.code === "insufficient_quota") return true;
+      const nestedError = nested as Record<string, unknown>;
+      if (nestedError.type === "rate_limit_exceeded" || nestedError.type === "insufficient_quota") return true;
+      if (nestedError.code === "rate_limit_exceeded" || nestedError.code === "insufficient_quota") return true;
     }
 
     // Fallback: message text matching
@@ -599,6 +653,46 @@ export class Embedder {
   }
 
   /**
+   * Voyage's embeddings endpoint rejects OpenAI SDK-injected request fields such
+   * as encoding_format. Use native fetch for Voyage so buildPayload() remains
+   * the exact serialized request body.
+   */
+  private isVoyageProvider(): boolean {
+    return this._providerProfile === "voyage-compatible";
+  }
+
+  private async fetchWithClientTimeout(
+    input: string,
+    init: RequestInit,
+    options: NativeFetchOptions,
+  ): Promise<Response> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), options.timeoutMs);
+    let unsubscribe: (() => void) | undefined;
+
+    if (options.signal) {
+      if (options.signal.aborted) {
+        clearTimeout(timeoutId);
+        throw new DOMException("The operation was aborted.", "AbortError");
+      }
+
+      const handler = () => controller.abort();
+      options.signal.addEventListener("abort", handler, { once: true });
+      unsubscribe = () => options.signal?.removeEventListener("abort", handler);
+    }
+
+    try {
+      return await fetch(input, {
+        ...init,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeoutId);
+      unsubscribe?.();
+    }
+  }
+
+  /**
    * Call embeddings.create using native fetch (bypasses OpenAI SDK).
    * Used exclusively for Ollama endpoints where AbortController must work
    * correctly to avoid long-lived stalled sockets.
@@ -611,7 +705,7 @@ export class Embedder {
    * See: https://github.com/CortexReach/memory-lancedb-pro/issues/620
    * Fix: https://github.com/CortexReach/memory-lancedb-pro/issues/629
    */
-  private async embedWithNativeFetch(payload: any, signal?: AbortSignal): Promise<any> {
+  private async embedWithNativeFetch(payload: EmbeddingRequestPayload, signal?: AbortSignal): Promise<ProviderEmbeddingResponse> {
     if (!this._baseURL) {
       throw new Error("embedWithNativeFetch requires a baseURL");
     }
@@ -624,7 +718,7 @@ export class Embedder {
     // If a model doesn't support that endpoint, failure will be silent from the user's perspective.
     // This is acceptable because most Ollama embedding models support /v1/embeddings.
     if (Array.isArray(payload.input)) {
-      const response = await fetch(base + "/v1/embeddings", {
+      const response = await this.fetchWithClientTimeout(base + "/v1/embeddings", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -637,23 +731,23 @@ export class Embedder {
           // from buildPayload() are intentionally not included. Ollama embedding models
           // do not support these parameters, so omitting them is correct.
         }),
+      }, {
         signal,
+        timeoutMs: this._clientTimeoutMs,
       });
 
       if (!response.ok) {
         const body = await response.text().catch(() => "");
-        throw new Error(
-          `Ollama batch embedding failed: ${response.status} ${response.statusText} ??${body.slice(0, 200)}`
-        );
+        throw new EmbeddingHttpError("Ollama batch", response.status, response.statusText, body);
       }
 
-      const data = await response.json() as any;
+      const data = await response.json() as ProviderEmbeddingResponse;
 
       // Validate response count and non-empty embeddings
       if (
         !Array.isArray(data?.data) ||
         data.data.length !== payload.input.length ||
-        data.data.some((item: any) => {
+        data.data.some((item) => {
           const embedding = item?.embedding;
           return !Array.isArray(embedding) || embedding.length === 0;
         })
@@ -667,7 +761,7 @@ export class Embedder {
     }
 
     // Single request: use /api/embeddings + prompt (PR #621 fix)
-    const response = await fetch(base + "/api/embeddings", {
+    const response = await this.fetchWithClientTimeout(base + "/api/embeddings", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -677,21 +771,50 @@ export class Embedder {
         model: payload.model,
         prompt: payload.input,
       }),
+    }, {
       signal,
+      timeoutMs: this._clientTimeoutMs,
     });
 
     if (!response.ok) {
       const body = await response.text().catch(() => "");
-      throw new Error(
-        `Ollama embedding failed: ${response.status} ${response.statusText} ??${body.slice(0, 200)}`
-      );
+      throw new EmbeddingHttpError("Ollama", response.status, response.statusText, body);
     }
 
-    const data = await response.json() as any;
+    const data = await response.json() as { embedding?: number[] };
 
     // Ollama /api/embeddings returns { embedding: number[] },
     // convert to OpenAI-compatible shape { data: [{ embedding: number[] }] }
     return { data: [{ embedding: data.embedding }] };
+  }
+
+  private async embedWithVoyageFetch(payload: EmbeddingRequestPayload, apiKey: string, signal?: AbortSignal): Promise<ProviderEmbeddingResponse> {
+    if (!this._baseURL) {
+      throw new Error(
+        "Voyage embedding provider requires embedding.baseURL, e.g. https://api.voyageai.com/v1"
+      );
+    }
+
+    const base = this._baseURL.replace(/\/$/, "");
+    const endpoint = base.endsWith("/embeddings") ? base : `${base}/embeddings`;
+    const response = await this.fetchWithClientTimeout(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(payload),
+    }, {
+      signal,
+      timeoutMs: this._clientTimeoutMs,
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      throw new EmbeddingHttpError("Voyage", response.status, response.statusText, body);
+    }
+
+    return response.json() as Promise<ProviderEmbeddingResponse>;
   }
 
   /**
@@ -703,7 +826,7 @@ export class Embedder {
    * because AbortController does not reliably abort Ollama's HTTP connections
    * through the SDK's HTTP client on Node.js.
    */
-  private async embedWithRetry(payload: any, signal?: AbortSignal): Promise<any> {
+  private async embedWithRetry(payload: EmbeddingRequestPayload, signal?: AbortSignal): Promise<ProviderEmbeddingResponse> {
     // Use native fetch for Ollama to ensure proper AbortController support
     if (this.isOllamaProvider()) {
       try {
@@ -721,10 +844,18 @@ export class Embedder {
     let lastError: Error | undefined;
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const client = this.nextClient();
       try {
+        if (this.isVoyageProvider()) {
+          const key = this.nextApiKey();
+          return await this.embedWithVoyageFetch(payload, key, signal);
+        }
+
+        const client = this.nextClient();
         // Pass signal to OpenAI SDK if provided (SDK v6+ supports this)
-        return await client.embeddings.create(payload, signal ? { signal } : undefined);
+        return await client.embeddings.create(
+          payload as OpenAIEmbeddingCreatePayload,
+          signal ? { signal } : undefined,
+        );
       } catch (error) {
         // If aborted, re-throw immediately
         if (error instanceof Error && error.name === 'AbortError') {
@@ -844,8 +975,8 @@ export class Embedder {
     }
   }
 
-  private buildPayload(input: string | string[], task?: string): any {
-    const payload: any = {
+  private buildPayload(input: string | string[], task?: string): EmbeddingRequestPayload {
+    const payload: EmbeddingRequestPayload = {
       model: this.model,
       input,
     };
