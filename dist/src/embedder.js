@@ -396,6 +396,8 @@ export class Embedder {
     _omitDimensions;
     /** Enable automatic chunking for long documents (default: true) */
     _autoChunk;
+    /** Optional code-boundary-aware chunking configuration */
+    _astChunking;
     constructor(config) {
         // Normalize apiKey to array and resolve environment variables
         const apiKeys = Array.isArray(config.apiKey) ? config.apiKey : [config.apiKey];
@@ -410,6 +412,7 @@ export class Embedder {
         this._omitDimensions = config.omitDimensions === true;
         // Enable auto-chunking by default for better handling of long documents
         this._autoChunk = config.chunking !== false;
+        this._astChunking = config.astChunking;
         const profile = detectEmbeddingProviderProfile(this._baseURL, this._model);
         this._providerProfile = profile;
         this._capabilities = getEmbeddingCapabilities(profile);
@@ -829,7 +832,7 @@ export class Embedder {
             if (isContextError && this._autoChunk) {
                 try {
                     console.log(`Document exceeded context limit (${errorMsg}), attempting chunking...`);
-                    const chunkResult = smartChunk(text, this._model);
+                    const chunkResult = smartChunk(text, this._model, this._astChunking);
                     if (chunkResult.chunks.length === 0) {
                         throw new Error(`Failed to chunk document: ${errorMsg}`);
                     }
@@ -931,7 +934,7 @@ export class Embedder {
                 try {
                     console.log(`Batch embedding failed with context error, attempting chunking...`);
                     const chunkResults = await Promise.all(validTexts.map(async (text, idx) => {
-                        const chunkResult = smartChunk(text, this._model);
+                        const chunkResult = smartChunk(text, this._model, this._astChunking);
                         if (chunkResult.chunks.length === 0) {
                             throw new Error("Chunker produced no chunks");
                         }
